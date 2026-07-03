@@ -1,0 +1,349 @@
+-- =============================================================================
+-- MIA Enterprise Sales Lakehouse — SQL Analytics Project
+-- Star Schema: FactOrders + DimCustomersSCD2 + DimProductsscd2 + DimDate
+-- Catalog: databricks_cata.gold
+-- =============================================================================
+
+
+-- =============================================================================
+-- SECTION 1: REVENUE ANALYSIS
+-- =============================================================================
+
+-- Q1. What is the total revenue and total orders per year?
+-- Business Problem: Understand year-on-year sales growth
+
+SELECT
+    d.year,
+    COUNT(DISTINCT f.order_id)          AS total_orders,
+    SUM(f.total_amount)                 AS total_revenue,
+    ROUND(AVG(f.total_amount), 2)       AS avg_order_value
+FROM databricks_cata.gold.FactOrders f
+LEFT JOIN databricks_cata.gold.DimDate d
+    ON f.DimDateKey = d.DimDateKey
+GROUP BY d.year
+ORDER BY d.year;
+
+
+-- Q2. What is the month-over-month revenue trend for each year?
+-- Business Problem: Identify seasonal peaks and slowdowns in sales
+
+SELECT
+    d.year,
+    d.month,
+    d.month_name,
+    SUM(f.total_amount)                                         AS monthly_revenue,
+    LAG(SUM(f.total_amount)) OVER (ORDER BY d.year, d.month)   AS prev_month_revenue,
+    ROUND(
+        (SUM(f.total_amount) - LAG(SUM(f.total_amount)) OVER (ORDER BY d.year, d.month))
+        / NULLIF(LAG(SUM(f.total_amount)) OVER (ORDER BY d.year, d.month), 0) * 100
+    , 2)                                                        AS mom_growth_pct
+FROM databricks_cata.gold.FactOrders f
+LEFT JOIN databricks_cata.gold.DimDate d
+    ON f.DimDateKey = d.DimDateKey
+GROUP BY d.year, d.month, d.month_name
+ORDER BY d.year, d.month;
+
+
+-- Q3. Which quarter drives the most revenue across all years?
+-- Business Problem: Plan marketing and inventory spend around peak quarters
+
+SELECT
+    d.year_quarter,
+    d.quarter,
+    SUM(f.total_amount)                     AS quarterly_revenue,
+    COUNT(DISTINCT f.order_id)              AS total_orders,
+    RANK() OVER (
+        PARTITION BY d.year
+        ORDER BY SUM(f.total_amount) DESC
+    )                                       AS revenue_rank_within_year
+FROM databricks_cata.gold.FactOrders f
+LEFT JOIN databricks_cata.gold.DimDate d
+    ON f.DimDateKey = d.DimDateKey
+GROUP BY d.year_quarter, d.quarter, d.year
+ORDER BY d.year_quarter;
+
+
+-- =============================================================================
+-- SECTION 2: CUSTOMER ANALYSIS
+-- =============================================================================
+
+-- Q4. Who are the top 10 customers by total revenue?
+-- Business Problem: Identify high-value customers for loyalty programs
+
+SELECT
+    c.customer_id,
+    c.fullname,
+    c.email,
+    c.city,
+    c.state,
+    COUNT(DISTINCT f.order_id)          AS total_orders,
+    SUM(f.total_amount)                 AS total_revenue,
+    ROUND(AVG(f.total_amount), 2)       AS avg_order_value
+FROM databricks_cata.gold.FactOrders f
+LEFT JOIN databricks_cata.gold.DimCustomersSCD2 c
+    ON f.DimCustomerKey = c.DimCustomerKey
+WHERE c.is_current = 1
+GROUP BY c.customer_id, c.fullname, c.email, c.city, c.state
+ORDER BY total_revenue DESC
+LIMIT 10;
+
+
+-- Q5. Which city generates the most revenue?
+-- Business Problem: Decide where to open new offices or run targeted campaigns
+
+SELECT
+    c.city,
+    c.state,
+    COUNT(DISTINCT c.customer_id)       AS total_customers,
+    COUNT(DISTINCT f.order_id)          AS total_orders,
+    SUM(f.total_amount)                 AS total_revenue,
+    ROUND(AVG(f.total_amount), 2)       AS avg_order_value
+FROM databricks_cata.gold.FactOrders f
+LEFT JOIN databricks_cata.gold.DimCustomersSCD2 c
+    ON f.DimCustomerKey = c.DimCustomerKey
+WHERE c.is_current = 1
+GROUP BY c.city, c.state
+ORDER BY total_revenue DESC
+LIMIT 15;
+
+
+-- Q6. How many customers placed only one order vs repeat orders?
+-- Business Problem: Measure customer retention and repeat purchase rate
+
+SELECT
+    order_frequency_bucket,
+    COUNT(customer_id)                  AS total_customers,
+    ROUND(
+        COUNT(customer_id) * 100.0 / SUM(COUNT(customer_id)) OVER ()
+    , 2)                                AS pct_of_customers
+FROM (
+    SELECT
+        c.customer_id,
+        COUNT(DISTINCT f.order_id)      AS order_count,
+        CASE
+            WHEN COUNT(DISTINCT f.order_id) = 1 THEN '1 - One-time Buyer'
+            WHEN COUNT(DISTINCT f.order_id) BETWEEN 2 AND 5 THEN '2 to 5 - Occasional Buyer'
+            ELSE '6+ - Loyal Buyer'
+        END                             AS order_frequency_bucket
+    FROM databricks_cata.gold.FactOrders f
+    LEFT JOIN databricks_cata.gold.DimCustomersSCD2 c
+        ON f.DimCustomerKey = c.DimCustomerKey
+    WHERE c.is_current = 1
+    GROUP BY c.customer_id
+) t
+GROUP BY order_frequency_bucket
+ORDER BY order_frequency_bucket;
+
+
+-- Q7. Customer Lifetime Value (CLV) — revenue per customer with their first and last order date
+-- Business Problem: Understand long-term value of each customer
+
+SELECT
+    c.customer_id,
+    c.fullname,
+    c.city,
+    COUNT(DISTINCT f.order_id)                          AS total_orders,
+    SUM(f.total_amount)                                 AS lifetime_revenue,
+    MIN(d.full_date)                                    AS first_order_date,
+    MAX(d.full_date)                                    AS last_order_date,
+    DATEDIFF(MAX(d.full_date), MIN(d.full_date))        AS customer_lifespan_days,
+    ROUND(
+        SUM(f.total_amount) / NULLIF(COUNT(DISTINCT f.order_id), 0)
+    , 2)                                                AS revenue_per_order
+FROM databricks_cata.gold.FactOrders f
+LEFT JOIN databricks_cata.gold.DimCustomersSCD2 c
+    ON f.DimCustomerKey = c.DimCustomerKey
+LEFT JOIN databricks_cata.gold.DimDate d
+    ON f.DimDateKey = d.DimDateKey
+WHERE c.is_current = 1
+GROUP BY c.customer_id, c.fullname, c.city
+ORDER BY lifetime_revenue DESC;
+
+
+-- =============================================================================
+-- SECTION 3: PRODUCT ANALYSIS
+-- =============================================================================
+
+-- Q8. What are the top 10 best-selling products by revenue?
+-- Business Problem: Identify which products drive the most revenue
+
+SELECT
+    p.product_id,
+    p.product_name,
+    p.brand,
+    p.category,
+    p.price,
+    COUNT(DISTINCT f.order_id)          AS total_orders,
+    SUM(f.quantity)                     AS total_units_sold,
+    SUM(f.total_amount)                 AS total_revenue
+FROM databricks_cata.gold.FactOrders f
+LEFT JOIN databricks_cata.gold.DimProductsscd2 p
+    ON f.DimProductKey = p.DimProductKey
+WHERE p.is_current = 1
+GROUP BY p.product_id, p.product_name, p.brand, p.category, p.price
+ORDER BY total_revenue DESC
+LIMIT 10;
+
+
+-- Q9. Which product category generates the most revenue?
+-- Business Problem: Decide which categories to invest in or promote
+
+SELECT
+    p.category,
+    COUNT(DISTINCT p.product_id)        AS total_products,
+    COUNT(DISTINCT f.order_id)          AS total_orders,
+    SUM(f.quantity)                     AS total_units_sold,
+    SUM(f.total_amount)                 AS total_revenue,
+    ROUND(
+        SUM(f.total_amount) * 100.0 / SUM(SUM(f.total_amount)) OVER ()
+    , 2)                                AS pct_of_total_revenue
+FROM databricks_cata.gold.FactOrders f
+LEFT JOIN databricks_cata.gold.DimProductsscd2 p
+    ON f.DimProductKey = p.DimProductKey
+WHERE p.is_current = 1
+GROUP BY p.category
+ORDER BY total_revenue DESC;
+
+
+-- Q10. Which brand has the highest average order value?
+-- Business Problem: Understand premium vs budget brand performance
+
+SELECT
+    p.brand,
+    COUNT(DISTINCT f.order_id)          AS total_orders,
+    SUM(f.total_amount)                 AS total_revenue,
+    ROUND(AVG(f.total_amount), 2)       AS avg_order_value,
+    ROUND(AVG(p.price), 2)              AS avg_product_price
+FROM databricks_cata.gold.FactOrders f
+LEFT JOIN databricks_cata.gold.DimProductsscd2 p
+    ON f.DimProductKey = p.DimProductKey
+WHERE p.is_current = 1
+GROUP BY p.brand
+ORDER BY avg_order_value DESC;
+
+
+-- Q11. Product performance ranked within each category using window functions
+-- Business Problem: Find the top performer in each category
+
+SELECT
+    category,
+    product_name,
+    brand,
+    total_revenue,
+    total_orders,
+    revenue_rank
+FROM (
+    SELECT
+        p.category,
+        p.product_name,
+        p.brand,
+        SUM(f.total_amount)                             AS total_revenue,
+        COUNT(DISTINCT f.order_id)                      AS total_orders,
+        RANK() OVER (
+            PARTITION BY p.category
+            ORDER BY SUM(f.total_amount) DESC
+        )                                               AS revenue_rank
+    FROM databricks_cata.gold.FactOrders f
+    LEFT JOIN databricks_cata.gold.DimProductsscd2 p
+        ON f.DimProductKey = p.DimProductKey
+    WHERE p.is_current = 1
+    GROUP BY p.category, p.product_name, p.brand
+) ranked
+WHERE revenue_rank <= 3
+ORDER BY category, revenue_rank;
+
+
+-- =============================================================================
+-- SECTION 4: ADVANCED ANALYTICS
+-- =============================================================================
+
+-- Q12. Running total of revenue per month (cumulative revenue trend)
+-- Business Problem: Track how quickly the business is hitting revenue targets
+
+SELECT
+    d.year,
+    d.month_name,
+    d.month,
+    SUM(f.total_amount)                                             AS monthly_revenue,
+    SUM(SUM(f.total_amount)) OVER (
+        PARTITION BY d.year
+        ORDER BY d.month
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    )                                                               AS cumulative_revenue_ytd
+FROM databricks_cata.gold.FactOrders f
+LEFT JOIN databricks_cata.gold.DimDate d
+    ON f.DimDateKey = d.DimDateKey
+GROUP BY d.year, d.month_name, d.month
+ORDER BY d.year, d.month;
+
+
+-- Q13. Weekend vs weekday revenue comparison
+-- Business Problem: Decide if weekend promotions are worth running
+
+SELECT
+    CASE WHEN d.is_weekend = 1 THEN 'Weekend' ELSE 'Weekday' END   AS day_type,
+    COUNT(DISTINCT f.order_id)                                      AS total_orders,
+    SUM(f.total_amount)                                             AS total_revenue,
+    ROUND(AVG(f.total_amount), 2)                                   AS avg_order_value,
+    ROUND(
+        SUM(f.total_amount) * 100.0 / SUM(SUM(f.total_amount)) OVER ()
+    , 2)                                                            AS pct_of_total_revenue
+FROM databricks_cata.gold.FactOrders f
+LEFT JOIN databricks_cata.gold.DimDate d
+    ON f.DimDateKey = d.DimDateKey
+GROUP BY d.is_weekend
+ORDER BY d.is_weekend;
+
+
+-- Q14. SCD2 impact analysis — customers who changed their city and how their order behavior shifted
+-- Business Problem: Understand if relocation affects purchasing behavior
+-- This query is unique to SCD2 — only possible because we preserved history
+
+SELECT
+    c.customer_id,
+    COUNT(DISTINCT c.DimCustomerKey)        AS total_versions,
+    MIN(c.effective_start_date)             AS first_seen,
+    MAX(c.effective_start_date)             AS last_change,
+    COUNT(DISTINCT f.order_id)              AS total_orders,
+    SUM(f.total_amount)                     AS total_revenue
+FROM databricks_cata.gold.DimCustomersSCD2 c
+LEFT JOIN databricks_cata.gold.FactOrders f
+    ON c.DimCustomerKey = f.DimCustomerKey
+GROUP BY c.customer_id
+HAVING COUNT(DISTINCT c.DimCustomerKey) > 1
+ORDER BY total_versions DESC;
+
+
+-- Q15. Full star schema join — complete order details for a business report
+-- Business Problem: Build a single flat view for Power BI or stakeholder reporting
+
+SELECT
+    f.order_id,
+    d.full_date                             AS order_date,
+    d.year,
+    d.month_name,
+    d.quarter,
+    d.day_name,
+    c.customer_id,
+    c.fullname                              AS customer_name,
+    c.email,
+    c.city,
+    c.state,
+    p.product_id,
+    p.product_name,
+    p.brand,
+    p.category,
+    p.price                                 AS unit_price,
+    f.quantity,
+    f.total_amount,
+    ROUND(f.total_amount / NULLIF(f.quantity, 0), 2)    AS effective_price_per_unit
+FROM databricks_cata.gold.FactOrders f
+LEFT JOIN databricks_cata.gold.DimCustomersSCD2 c
+    ON f.DimCustomerKey = c.DimCustomerKey
+LEFT JOIN databricks_cata.gold.DimProductsscd2  p
+    ON f.DimProductKey  = p.DimProductKey
+LEFT JOIN databricks_cata.gold.DimDate          d
+    ON f.DimDateKey     = d.DimDateKey
+WHERE c.is_current = 1
+  AND p.is_current = 1
+ORDER BY d.full_date DESC;
